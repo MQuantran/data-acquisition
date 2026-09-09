@@ -1,0 +1,21 @@
+# PyInstaller build output
+build/
+dist/
+*.pyc
+*.pyo
+__pycache__/
+*.spec.bak
+
+# generated (regenerate with assets/make_icon.py)
+assets/icon.png
+
+# local venvs / editor
+.venv/
+venv/
+.idea/
+.vscode/
+*.egg-info/
+
+# OS cruft
+.DS_Store
+Thumbs.db

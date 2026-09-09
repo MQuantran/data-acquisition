@@ -1,0 +1,5 @@
+numpy
+Pillow
+opencv-python
+scipy        # optional: point detection falls back to this if opencv is absent
+pyinstaller  # only needed to build the .exe

@@ -1,0 +1,51 @@
+name: release
+
+# Cut a release by pushing a version tag:
+#     (bump VERSION in app.py, update CHANGELOG.md, commit)
+#     git tag v0.4.0
+#     git push origin v0.4.0
+#
+# This builds the Windows bundle, runs the self-tests, and publishes a GitHub
+# Release with the .zip attached. The app's "Check for updates" reads that
+# release.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}       # allow a manual run from the Actions tab
+
+permissions:
+  contents: write             # needed to create the Release
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Self-tests
+        run: |
+          python updater.py --selftest
+          python core.py --selftest
+          python app.py --selftest
+
+      - name: Build one-folder bundle + zip
+        run: python build.py
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DataAcquisition-v*-win64.zip
+          generate_release_notes: true
+          body_path: CHANGELOG.md
+          fail_on_unmatched_files: true
