@@ -190,7 +190,10 @@ class App:
 
         def work():
             res = updater.check_for_update(VERSION)
-            self.root.after(0, lambda: self._update_done(res, startup))
+            try:
+                self.root.after(0, lambda: self._update_done(res, startup))
+            except tk.TclError:
+                pass          # window closed before the check returned
 
         threading.Thread(target=work, daemon=True).start()
 
