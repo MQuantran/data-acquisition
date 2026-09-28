@@ -9,9 +9,11 @@ Flow:
   5. "Add calibration ref" -> click the X reference, then the Y reference,
      then type their data values. Do this twice (4 clicks total).
      Wheel = zoom about cursor, middle-drag = pan, magnifier loupe = aim.
-  6. "Detect" -> review the red overlay. Prune strays: "Delete" (click one
+  6. "Detect" -> review the overlay marks. Prune strays: "Delete" (click one
      point) or "Eraser" (drag a size-adjustable square to wipe many at once,
-     e.g. letters of an annotation the detector picked up).
+     e.g. letters of an annotation the detector picked up). Then "Add point"
+     to click in the ones Detect missed -- snaps onto the curve colour if
+     one's nearby, else uses the exact click.
   7. "Export".
 
 Run the GUI:        python app.py
@@ -36,26 +38,38 @@ import core
 import updater
 import appconfig
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 MAG_SRC = 41          # source pixels shown in the magnifier
 MAG_VIEW = 205        # magnifier canvas size (px)  -> 5x
-MAX_DISPLAY_PX = 30_000_000
+MAX_ZOOM = 32.0       # only the visible viewport is ever rendered, so this
+                      # is a usability cap, not a memory one
+VIEW_MARGIN = 256     # canvas px rendered beyond each viewport edge (pan headroom)
+VIEW_TOPUP_MS = 150   # after a zoom, render the margin once the wheel is idle
 XH = "#00cc66"        # crosshair colour, normal
 XH_CAL = "#ff8c00"    # crosshair colour, calibration click pending
 
 GUIDE = (
     "1.  Paste an image (Ctrl+V) or  File-style  Open.  Type a dataset name.\n"
     "2.  Choose export format; pick Line or Points (and a marker shape).\n"
+    "    Circle markers stacked on each other: keep 'Split overlapping\n"
+    "    markers' ticked -- each marker in a merged blob is found from its\n"
+    "    visible arc of edge.  Set the marker radius if auto gets it wrong.\n"
     "3.  Pick curve colour -> click the curve / a marker. Tune the tolerance.\n"
+    "    Markers: use 'Snap marker' instead -> click one clean marker; shape,\n"
+    "    filled/hollow/edged, colour and size are all set from it.\n"
     "4.  (optional) Set plot area -> drag a box around the axes.\n"
     "5.  Add calibration ref -> click the X reference, then the Y reference,\n"
     "    then type their values.  Do this TWICE (2 refs, 4 clicks).\n"
     "    Mouse-wheel = zoom about cursor, middle-drag = pan,\n"
     "    the magnifier (bottom-left, 5x) is for precise aiming.\n"
-    "6.  Detect -> check the red overlay.  Prune strays with 'Delete'\n"
+    "6.  Detect -> check the marks ('Mark colour: auto' picks a colour\n"
+    "    that stands out from your markers).  Prune strays with 'Delete'\n"
     "    (click one point) or 'Eraser' (drag a size-adjustable square to\n"
     "    wipe a whole clump at once, e.g. an annotation read as points).\n"
+    "    Then 'Add point' -> click to fill in the ones Detect missed; it\n"
+    "    snaps onto the picked curve colour if one is close by, else it\n"
+    "    uses the exact click.  Added points can be Deleted again too.\n"
     "7.  Export.\n\n"
     "Tip: a tight plot-area box (step 4) that excludes the legend and tick\n"
     "labels makes detection much cleaner."
@@ -103,8 +117,14 @@ class App:
         self.image_name: str | None = None
         self.tkimg = None
         self.zoom = 1.0
-        self.mode = "normal"          # normal|pick_color|set_roi|calib_x|calib_y|delete|erase
+        self._view = None             # (zoom, x0, y0, x1, y1, margin) of the rendered tile
+        self._view_job = None         # pending margin top-up (after id)
+        self._photos = {}             # tile size -> reusable PhotoImage
+        self._sprite = None           # ((col, halo), RGBA point-mark stamp)
+        self.mode = "normal"          # normal|pick_color|snap_marker|set_roi|calib_x|calib_y|delete|erase|add
         self.target = None            # (r,g,b)
+        self.snap_template = None     # core.MarkerTemplate from "Snap marker"
+        self._bg_cache = None         # (image, background rgb) for auto marks
         self.roi = None               # (x0,y0,x1,y1) in image px
         self._roi_start = None
         self.refs: list[dict] = []    # calibration references
@@ -292,6 +312,12 @@ class App:
         self.swatch = tk.Label(crow, text="   ", bg="#dddddd", relief="sunken",
                                width=4)
         self.swatch.pack(side="left", padx=4)
+        # one click on a marker: shape + style + colours + size, all set
+        ttk.Button(left, text="Snap marker (click one clean marker)",
+                   command=lambda: self._set_mode("snap_marker")).pack(fill="x")
+        self.snap_lbl = ttk.Label(left, text="", wraplength=230,
+                                  foreground="#555555")
+        self.snap_lbl.pack(anchor="w")
         ttk.Label(left, text="Colour tolerance").pack(anchor="w")
         self.tol_var = tk.IntVar(value=60)
         ttk.Scale(left, from_=5, to=180, variable=self.tol_var,
@@ -320,6 +346,16 @@ class App:
                   orient="horizontal").pack(fill="x")
         ttk.Scale(self.area_row, from_=100, to=20000, variable=self.amax_var,
                   orient="horizontal").pack(fill="x")
+        # circle markers only: split stacked / overlapping markers
+        self.split_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.area_row,
+                        text="Split overlapping markers (circle)",
+                        variable=self.split_var).pack(anchor="w")
+        rrow = ttk.Frame(self.area_row); rrow.pack(fill="x")
+        ttk.Label(rrow, text="Marker radius px (0 = auto)").pack(side="left")
+        self.mr_var = tk.DoubleVar(value=0.0)
+        ttk.Spinbox(rrow, from_=0, to=100, increment=0.5, width=6,
+                    textvariable=self.mr_var).pack(side="right")
 
         # --- calibration ---
         hdr("4. Calibration  (2 refs = 4 clicks)")
@@ -343,20 +379,35 @@ class App:
         self.detect_btn.pack(fill="x")
         self.count_lbl = ttk.Label(left, text="—")
         self.count_lbl.pack(anchor="w")
+        # colour of the detection marks: 'auto' = farthest from the tracked
+        # marker colour AND the background, so marks never vanish on markers
+        mkrow = ttk.Frame(left); mkrow.pack(fill="x")
+        ttk.Label(mkrow, text="Mark colour").pack(side="left")
+        self.markcol_var = tk.StringVar(value="auto")
+        mk = ttk.Combobox(mkrow, textvariable=self.markcol_var, width=9,
+                          state="readonly",
+                          values=["auto", "red", "black", "cyan", "magenta"])
+        mk.pack(side="right")
+        mk.bind("<<ComboboxSelected>>", lambda e: self._redraw_overlays())
         self.del_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(left, text="Delete: click a red point",
+        ttk.Checkbutton(left, text="Delete: click a marked point",
                         variable=self.del_var,
-                        command=lambda: self._toggle_prune("delete")).pack(
+                        command=lambda: self._toggle_edit_mode("delete")).pack(
             anchor="w")
         self.erase_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(left, text="Eraser: drag a square",
                         variable=self.erase_var,
-                        command=lambda: self._toggle_prune("erase")).pack(
+                        command=lambda: self._toggle_edit_mode("erase")).pack(
             anchor="w")
         ttk.Label(left, text="Eraser size (px)").pack(anchor="w")
         self.eraser_var = tk.IntVar(value=30)
         ttk.Scale(left, from_=6, to=400, variable=self.eraser_var,
                   orient="horizontal").pack(fill="x")
+        self.add_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(left, text="Add point: click to add (snaps to curve)",
+                        variable=self.add_var,
+                        command=lambda: self._toggle_edit_mode("add")).pack(
+            anchor="w")
         ttk.Button(left, text="Export…", command=self.on_export).pack(
             fill="x", pady=(2, 0))
 
@@ -364,10 +415,11 @@ class App:
         cwrap = ttk.Frame(right)
         cwrap.pack(fill="both", expand=True)
         self.canvas = tk.Canvas(cwrap, bg="#2b2b2b", highlightthickness=0)
-        hbar = ttk.Scrollbar(cwrap, orient="horizontal",
-                             command=self.canvas.xview)
-        vbar = ttk.Scrollbar(cwrap, orient="vertical",
-                             command=self.canvas.yview)
+        # scrollbars re-render the viewport tile right after scrolling
+        hbar = ttk.Scrollbar(cwrap, orient="horizontal", command=lambda *a: (
+            self.canvas.xview(*a), self._render_view(VIEW_MARGIN)))
+        vbar = ttk.Scrollbar(cwrap, orient="vertical", command=lambda *a: (
+            self.canvas.yview(*a), self._render_view(VIEW_MARGIN)))
         self.canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         vbar.grid(row=0, column=1, sticky="ns")
@@ -400,7 +452,8 @@ class App:
         c.bind("<Button-4>", lambda e: self.on_wheel(e, 120))
         c.bind("<Button-5>", lambda e: self.on_wheel(e, -120))
         c.bind("<ButtonPress-2>", lambda e: c.scan_mark(e.x, e.y))
-        c.bind("<B2-Motion>", lambda e: c.scan_dragto(e.x, e.y, gain=1))
+        c.bind("<B2-Motion>", self.on_pan)
+        c.bind("<Configure>", lambda e: self._render_view(VIEW_MARGIN))
         self.root.bind("<Control-v>", self.on_paste)
         self.root.bind("<Control-V>", self.on_paste)
 
@@ -426,14 +479,21 @@ class App:
         self.mode = m
         hints = {
             "pick_color": "Click the curve / a marker to sample its colour.",
+            "snap_marker": "Click ONE isolated marker (anywhere on it, or just "
+                           "next to it). Shape, style, colour and size are "
+                           "read off it and set for Points detection.",
             "set_roi": "Drag a rectangle around the axes box.",
             "calib_x": "Calibration: click the X reference "
                        "(e.g. an x-axis tick).",
             "calib_y": "Calibration: now click the Y reference "
                        "(e.g. a y-axis tick).",
-            "delete": "Delete mode: click a red point to remove it.",
+            "delete": "Delete mode: click a marked point to remove it.",
             "erase": "Eraser: click / drag the square to wipe every point "
                      "inside it. Adjust 'Eraser size'.",
+            "add": "Add point: click on the plot. Snaps onto the nearest "
+                  "curve-colour pixel if one is close by, else uses the "
+                  "exact click. Added points can be removed again with "
+                  "Delete, same as detected ones.",
             "normal": "",
         }
         self._status(hints.get(m, ""))
@@ -476,7 +536,10 @@ class App:
         if not self.name_var.get():
             self.name_var.set(os.path.splitext(self.image_name)[0])
         self.target = None
+        self.snap_template = None
         self.swatch.configure(bg="#dddddd")
+        if hasattr(self, "snap_lbl"):
+            self.snap_lbl.configure(text="")
         self.roi = None
         self.refs.clear()
         self.calibration = None
@@ -485,6 +548,7 @@ class App:
         self.mode = "normal"
         self.del_var.set(False)
         self.erase_var.set(False)
+        self.add_var.set(False)
         self.count_lbl.configure(text="—")
         self._update_cal_label()
         self.root.update_idletasks()
@@ -494,28 +558,184 @@ class App:
         self.zoom = min(cw / W, ch / H, 1.0)
         self.zoom = max(self.zoom, 0.05)
         self._render()
-        self._redraw_overlays()
+        self._redraw_overlays(marks=False)
         self._status(f"Loaded {self.image_name}  ({W}x{H}px).  "
                      f"Pick a colour, set calibration, then Detect.")
 
     # ------------------------------------------------------------ rendering
-    def _render(self):
-        if self.base_img is None:
-            return
+    # The scrollregion always spans the whole zoomed image (canvas coords =
+    # image px * zoom), so img_xy / overlays / scrollbars never see the
+    # tiling. Only the visible viewport (+ VIEW_MARGIN) is actually resized
+    # into a PhotoImage and placed at its canvas offset -- the cost of a
+    # zoom step no longer grows with zoom^2.
+    def _set_zoom_region(self):
+        """Clamp the zoom and size the scrollregion to the zoomed image."""
         W, H = self.base_img.size
-        zmax = (MAX_DISPLAY_PX / (W * H)) ** 0.5
-        self.zoom = min(self.zoom, max(1.0, zmax))
+        self.zoom = min(self.zoom, MAX_ZOOM)
         dw, dh = max(1, int(W * self.zoom)), max(1, int(H * self.zoom))
-        rs = Image.NEAREST if self.zoom >= 1 else Image.BILINEAR
-        disp = self.base_img.resize((dw, dh), rs)
-        self.tkimg = ImageTk.PhotoImage(disp)
-        self.canvas.delete("IMG")
-        self.canvas.create_image(0, 0, anchor="nw", image=self.tkimg, tags="IMG")
-        self.canvas.tag_lower("IMG")
         self.canvas.configure(scrollregion=(0, 0, dw, dh))
         self.zoom_var.set(f"{self.zoom * 100:.0f}%")
 
-    def _redraw_overlays(self):
+    def _render(self):
+        if self.base_img is None:
+            return
+        self._set_zoom_region()
+        self._render_view(0, force=True)
+        self._schedule_view_topup()
+
+    def _render_view(self, margin=0, force=False):
+        """Render the image tile covering the viewport (+ `margin` canvas px).
+
+        No-op when the current tile, at this zoom, already covers the
+        viewport (and at least `margin` of headroom was asked for before).
+        """
+        if self.base_img is None:
+            return
+        c = self.canvas
+        W, H = self.base_img.size
+        z = self.zoom
+        dw, dh = max(1, int(W * z)), max(1, int(H * z))
+        cw, ch = c.winfo_width(), c.winfo_height()
+        if cw <= 1 or ch <= 1:                   # not mapped yet (e.g. selftest)
+            cw, ch = c.winfo_reqwidth(), c.winfo_reqheight()
+        vx0, vy0 = int(c.canvasx(0)), int(c.canvasy(0))
+        need = (max(0, vx0), max(0, vy0), min(dw, vx0 + cw), min(dh, vy0 + ch))
+        v = self._view
+        if (not force and v is not None and v[0] == z and v[5] >= margin
+                and v[1] <= need[0] and v[2] <= need[1]
+                and v[3] >= need[2] and v[4] >= need[3]):
+            return
+        # Keep the tile size fixed so the (cached) PhotoImage can be reused
+        # -- building a new one costs ~2x a paste: near an image edge the
+        # tile slides inward instead of shrinking, and a zoomed image
+        # narrower / shorter than the window is padded with the canvas
+        # colour to the window size (unless it's small: a fresh small
+        # PhotoImage is cheaper than a window-sized paste).
+        tw, th = min(cw + 2 * margin, dw), min(ch + 2 * margin, dh)
+        if 2 * tw * th > cw * ch:
+            tw, th = max(tw, cw), max(th, ch)
+        x0 = max(0, min(vx0 - margin, dw - tw))
+        y0 = max(0, min(vy0 - margin, dh - th))
+        x1, y1 = x0 + tw, y0 + th
+        if z >= 1:
+            # canvas px cx shows source px floor(cx / z) -- exactly the pixel
+            # img_xy() reports for a click there (tiny eps: fp at boundaries)
+            eps = 1e-6
+            aff = (1 / z, 0, (x0 - 0.5) / z + eps, 0, 1 / z, (y0 - 0.5) / z + eps)
+            try:
+                # Pillow internals: transform straight into a single memory
+                # block, which ImageTk.PhotoImage.paste can hand to Tk as
+                # is (it otherwise makes a full copy first: ~5 ms/frame)
+                tile = Image.new("RGB", (1, 1))._new(
+                    Image.core.new_block("RGB", (tw, th)))
+                tile.im.transform((0, 0, tw, th), self.base_img.im,
+                                  Image.Transform.AFFINE, aff,
+                                  Image.Resampling.NEAREST, 1)
+            except Exception:                    # other Pillow: public API
+                tile = self.base_img.transform((tw, th), Image.AFFINE, aff,
+                                               resample=Image.NEAREST)
+        else:
+            ex, ey = min(x1, dw), min(y1, dh)
+            tile = Image.new("RGB", (tw, th))
+            tile.paste(self.base_img.resize(
+                (ex - x0, ey - y0), Image.BILINEAR,
+                box=(x0 / z, y0 / z, min(W, ex / z), min(H, ey / z))))
+        # blank whatever lies past the zoomed image's edge (padding)
+        bg = tuple(v >> 8 for v in c.winfo_rgb(c.cget("bg")))
+        if x1 > dw:
+            tile.paste(bg, (dw - x0, 0, tw, th))
+        if y1 > dh:
+            tile.paste(bg, (0, dh - y0, tw, th))
+        self._view = (z, x0, y0, x1, y1, margin)
+        self._show_tile(tile, x0, y0)
+
+    def _show_tile(self, tile, x0, y0):
+        """Stamp the point marks onto a fresh tile and put it on screen.
+
+        Marks are baked into the tile rather than being 4 canvas items per
+        point: Tk redraws every visible item on each scroll / zoom, which
+        for 300 points was ~20 ms per frame on its own. Stamped in place
+        (no unmarked copy kept); a point edit re-renders the tile instead.
+        """
+        c = self.canvas
+        if self.det_px:
+            col, halo = self._mark_colours()
+            sp = self._mark_sprite(col, halo)
+            r = sp.width // 2
+            p = np.asarray(self.det_px, float) * self.zoom
+            p = np.floor(p - (x0, y0)).astype(int)
+            inb = ((p[:, 0] > -r - 1) & (p[:, 0] < tile.width + r)
+                   & (p[:, 1] > -r - 1) & (p[:, 1] < tile.height + r))
+            for (px, py) in p[inb]:
+                tile.paste(sp, (int(px) - r, int(py) - r), sp)
+        self.tkimg = self._tile_photo(tile.size)
+        self.tkimg.paste(tile)
+        if c.find_withtag("IMG"):
+            c.itemconfigure("IMG", image=self.tkimg)
+            c.coords("IMG", x0, y0)
+        else:
+            c.create_image(x0, y0, anchor="nw", image=self.tkimg, tags="IMG")
+        c.tag_lower("IMG")
+
+    def _mark_sprite(self, col, halo):
+        """RGBA stamp of one point mark: halo ring, ring, centre cross.
+
+        Same look as the old canvas items (8 px ring + 3 px halo in the
+        opposite shade, 4 px centre cross), centred on pixel (r, r).
+        """
+        key = (col, halo)
+        if self._sprite is None or self._sprite[0] != key:
+            from PIL import ImageDraw
+            s = Image.new("RGBA", (13, 13), (0, 0, 0, 0))
+            d = ImageDraw.Draw(s)
+            k = 6
+            # halo underneath in the opposite shade keeps the mark readable
+            # on any mix of marker / background / gridline pixels
+            d.ellipse([k - 5, k - 5, k + 5, k + 5], outline=halo, width=3)
+            d.ellipse([k - 4, k - 4, k + 4, k + 4], outline=col, width=1)
+            d.line([(k - 1, k), (k + 2, k)], fill=col)
+            d.line([(k, k - 1), (k, k + 2)], fill=col)
+            self._sprite = (key, s)
+        return self._sprite[1]
+
+    def _tile_photo(self, size):
+        """A reusable PhotoImage of `size` (the 2 most recent sizes kept).
+
+        Pasting into a PhotoImage Tk is already displaying is ~2x cheaper
+        than building a new one (Tk updates its display instance in place
+        instead of allocating one). Tile sizes alternate between viewport
+        and viewport + margin, so each cached photo is pinned by a hidden
+        canvas item to keep its display instance alive while not shown.
+        """
+        p = self._photos.pop(size, None)
+        fresh = p is None
+        if fresh:
+            p = ImageTk.PhotoImage("RGB", size)
+        self._photos[size] = p                   # (re)insert = most recent
+        while len(self._photos) > 2:
+            del self._photos[next(iter(self._photos))]
+            fresh = True
+        if fresh:
+            c = self.canvas
+            c.delete("IMGKEEP")
+            for q in self._photos.values():
+                c.create_image(0, 0, anchor="nw", image=q, state="hidden",
+                               tags="IMGKEEP")
+        return p
+
+    def _schedule_view_topup(self):
+        """Add the pan margin once zooming pauses (keeps wheel ticks cheap)."""
+        if self._view_job is not None:
+            self.root.after_cancel(self._view_job)
+
+        def run():
+            self._view_job = None
+            self._render_view(VIEW_MARGIN)
+        self._view_job = self.root.after(VIEW_TOPUP_MS, run)
+
+    def _redraw_overlays(self, marks=True):
+        """ROI box + calibration lines as canvas items; `marks` also re-stamps
+        the point marks (they are baked into the image tile)."""
         c = self.canvas
         c.delete("OV")
         z = self.zoom
@@ -531,9 +751,27 @@ class App:
                               fill="#3b7dd8", dash=(2, 2), tags="OV")
                 c.create_line(0, r["py"] * z, W2, r["py"] * z,
                               fill="#3b7dd8", dash=(2, 2), tags="OV")
-        for (ix, iy) in self.det_px:
-            c.create_oval(ix * z - 3, iy * z - 3, ix * z + 3, iy * z + 3,
-                          outline="red", width=1, tags=("OV", "PT"))
+        if marks and self._view is not None:     # marks live in the tile
+            self._render_view(0, force=True)     # viewport now, margin later
+            self._schedule_view_topup()
+
+    def _mark_colours(self):
+        """(mark colour, halo colour) as Tk hex strings."""
+        name = self.markcol_var.get()
+        if name == "auto":
+            avoid = [self.target]
+            if self.base_img is not None:
+                if self._bg_cache is None or self._bg_cache[0] is not self.base_img:
+                    small = np.asarray(self.base_img.convert("RGB").resize(
+                        (min(400, self.base_img.width),
+                         min(300, self.base_img.height))))
+                    self._bg_cache = (self.base_img, core._background_rgb(small))
+                avoid.append(self._bg_cache[1])
+            name = core.best_mark_colour(avoid)
+        rgb = core.MARK_COLOURS[name]
+        lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+        halo = "#000000" if lum > 140 else "#ffffff"
+        return "#%02x%02x%02x" % rgb, halo
 
     # ------------------------------------------------------------ mouse
     def on_motion(self, event):
@@ -563,16 +801,24 @@ class App:
         d = delta if delta is not None else event.delta
         ix, iy = self.img_xy(event)
         factor = 1.25 if d > 0 else 0.8
-        new = min(max(self.zoom * factor, 0.05), 40)
+        new = min(max(self.zoom * factor, 0.05), MAX_ZOOM)
         if abs(new - self.zoom) < 1e-6:
             return
         self.zoom = new
-        self._render()
+        self._set_zoom_region()
         W, H = self.base_img.size
         sw, sh = W * self.zoom, H * self.zoom
         self.canvas.xview_moveto(max(0.0, (ix * self.zoom - event.x) / sw))
         self.canvas.yview_moveto(max(0.0, (iy * self.zoom - event.y) / sh))
-        self._redraw_overlays()
+        # tile for the NEW view only (no margin), margin added once idle
+        self._render_view(0, force=True)
+        self._schedule_view_topup()
+        self._redraw_overlays(marks=False)
+
+    def on_pan(self, event):
+        """Middle-drag pan; re-tile only when the view leaves the tile."""
+        self.canvas.scan_dragto(event.x, event.y, gain=1)
+        self._render_view(VIEW_MARGIN)
 
     def on_click(self, event):
         if self.base_img is None:
@@ -587,6 +833,8 @@ class App:
             self.swatch.configure(bg="#%02x%02x%02x" % self.target)
             self._set_mode("normal")
             self._status(f"colour = rgb{self.target}")
+        elif self.mode == "snap_marker":
+            self._snap_marker_at(ixc, iyc)
         elif self.mode == "set_roi":
             self._roi_start = (ixc, iyc)
         elif self.mode == "calib_x":
@@ -598,6 +846,8 @@ class App:
             self._delete_near(ix, iy)
         elif self.mode == "erase":
             self._erase_at(ix, iy)
+        elif self.mode == "add":
+            self._add_point_at(ixc, iyc)
 
     def on_drag(self, event):
         if self.mode == "erase":
@@ -609,7 +859,7 @@ class App:
             ix, iy = self.img_xy(event)
             x0, y0 = self._roi_start
             self.roi = (x0, y0, ix, iy)
-            self._redraw_overlays()
+            self._redraw_overlays(marks=False)
 
     def on_release(self, event):
         if self.mode == "set_roi" and self._roi_start is not None:
@@ -619,7 +869,7 @@ class App:
                                          max(x0, ix), max(y0, iy))))
             self._roi_start = None
             self._set_mode("normal")
-            self._redraw_overlays()
+            self._redraw_overlays(marks=False)
             self._status(f"plot area set: {tuple(round(v) for v in self.roi)}")
 
     # ------------------------------------------------------------ magnifier
@@ -689,7 +939,7 @@ class App:
         self._cal_px = None
         self._update_cal_label()
         self._rebuild_cal()
-        self._redraw_overlays()
+        self._redraw_overlays(marks=False)
         if len(self.refs) < 2:
             self._status("first reference stored. Add the second "
                          "(Add calibration ref).")
@@ -715,11 +965,11 @@ class App:
         self._cal_px = None
         self.mode = "normal"
         self._update_cal_label()
-        self._redraw_overlays()
+        self._redraw_overlays(marks=False)
 
     def _clear_roi(self):
         self.roi = None
-        self._redraw_overlays()
+        self._redraw_overlays(marks=False)
         self._status("plot area cleared (using whole image).")
 
     # ------------------------------------------------------------ detect
@@ -741,24 +991,41 @@ class App:
             else:
                 amin = int(self.amin_var.get())
                 amax = max(amin + 1, int(self.amax_var.get()))
+                split = (self.split_var.get()
+                         and self.shape_var.get() == "circle")
+                try:
+                    mr = float(self.mr_var.get())
+                except (tk.TclError, ValueError):
+                    mr = 0.0
                 data, px = core.extract_points(
                     rgb, self.calibration, self.target, tol, self.roi,
-                    area=(amin, amax), shape=self.shape_var.get())
-                kind = "points"
+                    area=(amin, amax), shape=self.shape_var.get(),
+                    split_overlaps=split, marker_r=mr if mr > 0 else None)
+                kind = "points" + (" (overlaps split)" if split else "")
         except Exception as e:
             messagebox.showerror("Detection failed", str(e)); return
         self.det_data = data
         self.det_px = [tuple(map(float, p)) for p in px]
         self.count_lbl.configure(text=f"{len(px)} {kind}")
         self._redraw_overlays()
-        self._status(f"detected {len(px)} {kind}. Review the red overlay; "
+        self._status(f"detected {len(px)} {kind}. Review the marks; "
                      f"prune with Delete / Eraser, then Export.")
 
-    def _toggle_prune(self, which):
-        """`delete` and `erase` are mutually exclusive prune modes."""
-        on = self.del_var.get() if which == "delete" else self.erase_var.get()
+    def _toggle_edit_mode(self, which):
+        """`delete`, `erase`, `add` are mutually exclusive point-edit modes."""
+        edit_vars = {"delete": self.del_var, "erase": self.erase_var,
+                    "add": self.add_var}
+        on = edit_vars[which].get()
+        if on and which == "add" and self.calibration is None:
+            messagebox.showinfo(
+                "Not ready", "Add calibration (2 references) before adding "
+                             "points by hand.")
+            edit_vars[which].set(False)
+            return
         if on:
-            (self.erase_var if which == "delete" else self.del_var).set(False)
+            for k, v in edit_vars.items():
+                if k != which:
+                    v.set(False)
             self.mode = which
         else:
             self.mode = "normal"
@@ -796,6 +1063,83 @@ class App:
         p = np.asarray(self.det_px, float)
         keep = ~((np.abs(p[:, 0] - ix) <= h) & (np.abs(p[:, 1] - iy) <= h))
         self._keep_mask(keep)
+
+    def _snap_marker_at(self, ix, iy):
+        """Cut out the clicked marker and configure Points detection from it.
+
+        Colour picking sees one colour of a marker (face OR edge); snapping
+        takes the whole marker, classifies shape (circle / square / diamond /
+        triangle) and style (filled / hollow / edged), and sets: the colour
+        to track (face; the stroke for hollow), marker shape, marker radius
+        (circle splitting), and the area limits.
+        """
+        rgb = np.asarray(self.base_img.convert("RGB"))
+        try:
+            t = core.sample_marker(rgb, ix, iy)
+        except Exception as e:
+            messagebox.showerror("Snap failed", str(e)); return
+        self._set_mode("normal")
+        if t is None:
+            self._status("snap: nothing but background near the click -- "
+                         "click on a marker.")
+            return
+        self.snap_template = t
+        self.target = tuple(int(v) for v in t.detect_rgb)
+        self.swatch.configure(bg="#%02x%02x%02x" % self.target)
+        self.mode_var.set("points")
+        self._refresh_controls()
+        # merged / unrecognised snap: its shape + size would mislead the
+        # detector -- keep the colour, leave shape/size to the user.
+        # (a merely tiny marker still classifies shape reliably)
+        trust = t.confident or t.size < 9 and t.shape != "other"
+        if trust:
+            self.shape_var.set(t.shape)
+            self.mr_var.set(round(t.r, 1) if t.shape == "circle" else 0.0)
+            a = max(1.0, t.area)
+            self.amin_var.set(max(1, int(0.3 * a)))
+            self.amax_var.set(int(max(self.amin_var.get() + 1, 3 * a)))
+        self.snap_lbl.configure(text="snapped: " + t.describe())
+        self._status("snap: " + t.describe() + (
+            ".  Now Detect." if trust else
+            ".  Colour set; shape/size NOT changed -- snap a cleaner marker "
+            "or set them by hand."))
+
+    def _add_point_at(self, ix, iy):
+        """Manually add one point at image pixel (ix, iy).
+
+        If a curve colour has been picked, the click snaps to the nearest
+        matching-colour pixel within a small window (same precision as
+        auto-detect); otherwise it uses the exact click. Used to fill in
+        points Detect missed, after pruning the wrong ones with Delete /
+        Eraser -- the new point lands in the same `det_px` / `det_data`
+        arrays as detected ones, so Delete removes it the same way too.
+        """
+        if self.calibration is None:
+            return
+        sx, sy = ix, iy
+        snapped = False
+        if self.target is not None:
+            rgb = np.asarray(self.base_img)
+            hit = core.snap_point(rgb, self.target, float(self.tol_var.get()),
+                                  ix, iy)
+            if hit is not None:
+                sx, sy = hit
+                snapped = True
+        X, Y = self.calibration.pixel_to_data(sx, sy)
+        X, Y = float(X), float(Y)
+        if self.det_data is None or len(self.det_px) == 0:
+            self.det_px = [(sx, sy)]
+            self.det_data = np.array([[X, Y]], dtype=float)
+        else:
+            self.det_px.append((sx, sy))
+            self.det_data = np.vstack([self.det_data, [X, Y]])
+        order = np.argsort(self.det_data[:, 0])
+        self.det_data = self.det_data[order]
+        self.det_px = [self.det_px[i] for i in order]
+        self.count_lbl.configure(text=f"{len(self.det_px)} pts (+1 manual)")
+        self._redraw_overlays()
+        self._status(f"added point  x={X:.5g}  y={Y:.5g}"
+                     + ("  (snapped to curve)" if snapped else "  (exact click)"))
 
     # ------------------------------------------------------------ export
     def on_export(self):
@@ -866,6 +1210,42 @@ def _selftest() -> int:
     n_after = len(app.det_px)
     erased_ok = 0 < (n - n_after) <= 40
     n = n_after
+    # exercise "Add point": re-add (a couple px off) what was just erased --
+    # should snap back onto the curve colour, not the exact off-target click
+    add_x_expect, _ = app.calibration.pixel_to_data(mid[0], mid[1])
+    app._add_point_at(mid[0] + 2, mid[1] - 1)
+    n_after_add = len(app.det_px)
+    add_snap_ok = (n_after_add == n_after + 1 and float(np.min(np.abs(
+        app.det_data[:, 0] - float(add_x_expect)))) < 0.05)
+    # fallback path: no curve colour picked -> exact click, no snapping
+    saved_target, app.target = app.target, None
+    click_x, click_y = bx0 + 40, by1 - 40
+    exp_x, _ = app.calibration.pixel_to_data(click_x, click_y)
+    app._add_point_at(click_x, click_y)
+    add_manual_ok = (len(app.det_px) == n_after_add + 1 and float(np.min(np.abs(
+        app.det_data[:, 0] - float(exp_x)))) < 1e-6)
+    app.target = saved_target
+    n = len(app.det_px)
+    # "Snap marker": edged circle (red face, black edge) + a hollow triangle
+    im2 = Image.new("RGB", (300, 200), "white")
+    d2 = ImageDraw.Draw(im2)
+    d2.ellipse([60, 60, 84, 84], fill=(210, 30, 30), outline=(0, 0, 0), width=2)
+    d2.polygon([(200, 60), (188, 84), (212, 84)], outline=(30, 30, 200))
+    saved = (app.base_img, app.target)
+    app.base_img = im2
+    app._snap_marker_at(62, 72)                      # click ON the black edge
+    snap_c = (app.shape_var.get() == "circle" and app.mode_var.get() == "points"
+              and app.snap_template.style == "edged"
+              and abs(app.target[0] - 210) < 30 and app.target[1] < 60)
+    app._snap_marker_at(200, 76)                     # click INSIDE the hollow
+    snap_t = (app.shape_var.get() == "triangle"
+              and app.snap_template.style == "hollow")
+    app.base_img, app.target = saved
+    app.mode_var.set("line")
+    print(f"snap marker: edged circle {'ok' if snap_c else 'FAIL'}   "
+          f"hollow triangle {'ok' if snap_t else 'FAIL'}")
+    print(f"add point (snap to curve): {'ok' if add_snap_ok else 'FAIL'}   "
+          f"add point (no-target fallback): {'ok' if add_manual_ok else 'FAIL'}")
     import tempfile
     p = os.path.join(tempfile.gettempdir(), "_daq_gui_selftest.csv")
     core.export_data(p, app.det_data, "csv", core.build_meta(
@@ -880,11 +1260,78 @@ def _selftest() -> int:
           f"(calibration {'ok' if app.calibration else 'FAIL'}, "
           f"eraser {'ok' if erased_ok else 'FAIL'}, "
           f"export {'ok' if wrote else 'FAIL'})")
+    cal_ok = app.calibration is not None
+    view_ok, view_msg = _selftest_view(app)          # loads its own image
+    print(f"viewport render: {'ok' if view_ok else 'FAIL'} {view_msg}")
     root.destroy()
-    ok = (n > 60 and app.calibration is not None and wrote and erased_ok
-          and upd_ok)
+    ok = (n > 60 and cal_ok and wrote and erased_ok
+          and add_snap_ok and add_manual_ok and upd_ok and snap_c and snap_t
+          and view_ok)
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def _selftest_view(app) -> tuple[bool, str]:
+    """Viewport tiling: at several zooms / scroll positions, the image pixel
+    img_xy() reports under a canvas point is the expected one, AND the tile
+    on screen shows that very source pixel there; point marks land on the
+    right spot too. Loads its own image (resets the app state)."""
+    import types
+    W, H = 160, 120
+    yy, xx = np.mgrid[0:H, 0:W]
+    arr = np.stack([xx * 3 % 256, yy * 2, (xx * 7 + yy * 13) % 256],
+                   -1).astype(np.uint8)
+    app._load(Image.fromarray(arr), "grid.png")
+    c = app.canvas
+    cw, ch = c.winfo_width(), c.winfo_height()
+    if cw <= 1 or ch <= 1:                   # withdrawn root: as _render_view
+        cw, ch = c.winfo_reqwidth(), c.winfo_reqheight()
+    checked = 0
+    for z in (0.6, 1.0, 1.7, 2.5, 4.0, 7.3, 16.0, MAX_ZOOM):
+        app.zoom = z
+        app._render()
+        dw, dh = int(W * z), int(H * z)
+        for frac in (0.0, 0.37, 0.8):
+            c.xview_moveto(frac)
+            c.yview_moveto(frac)
+            app._render_view(VIEW_MARGIN)            # as scrollbars / pan do
+            ox = round(c.xview()[0] * dw)
+            oy = round(c.yview()[0] * dh)
+            tx, ty = (int(v) for v in c.coords("IMG"))
+            for (x, y) in ((0, 0), (cw // 3, ch // 2), (cw - 1, ch - 1),
+                           (17, ch // 5)):
+                ix, iy = app.img_xy(types.SimpleNamespace(x=x, y=y))
+                if abs(ix - (ox + x) / z) > 1e-9 or abs(iy - (oy + y) / z) > 1e-9:
+                    return False, f"img_xy z={z} scroll={frac} at ({x},{y})"
+                if z < 1 or ix >= W or iy >= H:  # bilinear / off-image: skip
+                    continue
+                try:
+                    got = c.tk.call(str(app.tkimg), "get",
+                                    ox + x - tx, oy + y - ty)
+                except tk.TclError:                  # point not on the tile
+                    return False, f"no tile under z={z} scroll={frac} ({x},{y})"
+                got = tuple(int(v) for v in (got.split() if isinstance(got, str)
+                                             else got))
+                want = tuple(int(v) for v in arr[int(iy), int(ix)])
+                if got != want:
+                    return False, (f"pixel z={z} scroll={frac} at ({x},{y}): "
+                                   f"shows {got}, source {want}")
+                checked += 1
+    # a point mark: its centre cross is drawn on the marked pixel
+    app.zoom = 4.0
+    app._render()
+    c.xview_moveto(0.0)
+    c.yview_moveto(0.0)
+    app.det_px = [(20.3, 10.6)]
+    app._redraw_overlays()
+    tx, ty = (int(v) for v in c.coords("IMG"))
+    got = c.tk.call(str(app.tkimg), "get", int(20.3 * 4) - tx, int(10.6 * 4) - ty)
+    got = "#%02x%02x%02x" % tuple(int(v) for v in (
+        got.split() if isinstance(got, str) else got))
+    if got != app._mark_colours()[0]:
+        return False, f"mark centre shows {got}"
+    app.det_px = []
+    return checked > 30, f"({checked} pixels checked)"
 
 
 def main():

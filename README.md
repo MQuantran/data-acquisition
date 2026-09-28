@@ -65,7 +65,15 @@ To ship a new version, see **`RELEASING.md`** (bump `VERSION` in `app.py`, tag
    - **Line** — one sample per pixel column (median row of the colour mask).
    - **Points** — connected-component centroids; choose the **marker shape**
      (`any` / `circle` / `square` / `triangle` / `diamond` — a soft filter).
-3. **Curve colour** — `Pick curve colour`, then click the curve / a marker.
+     With `circle`, **Split overlapping markers** (on by default) separates
+     stacked / touching markers: the marker size is learned from the plot,
+     and each marker in a merged blob is found from its visible arc of edge.
+     If the auto radius is off, set **Marker radius px**.
+3. **Curve colour** — for **markers**, prefer `Snap marker`: click one clean
+   marker (on it, just beside it, or inside a hollow one). Shape, filled /
+   hollow / edged, the colour to track and the marker size are read off it and
+   set for you. A low-confidence snap (merged markers) sets only the colour.
+   Otherwise `Pick curve colour`, then click the curve / a marker.
    Adjust **Colour tolerance** if the mask is too tight or too greedy.
    Optionally `Set plot area (drag)` a rectangle around the axes box — this
    excludes the legend, tick labels and frame and sharply improves results.
@@ -79,11 +87,21 @@ To ship a new version, see **`RELEASING.md`** (bump `VERSION` in `app.py`, tag
    pans, and the **magnifier** (bottom-left, 5×) shows the exact pixel under a
    green crosshair with a red centre box. Once calibrated, the readout shows live
    `x, y` data coordinates under the cursor.
-5. **Detect** — review the **red overlay**. Prune strays with either:
-   - **Delete** — click a single red point (e.g. one mis-picked legend marker).
+5. **Detect** — review the **marks** on the plot. **Mark colour** `auto` (default)
+   draws them in whichever of black / red / cyan / magenta / yellow / white is
+   farthest from your marker colour and the background (red markers → cyan
+   marks); pick red / black / cyan / magenta to force one. Prune strays with either:
+   - **Delete** — click a single mark (e.g. one mis-picked legend marker).
    - **Eraser** — tick it, set **Eraser size (px)**, then click/drag the red
      square to wipe every point inside it at once. Use this when the detector
      read an **annotation / text block** as a cloud of points.
+   Then tick **Add point** and click anywhere Detect missed a real point — it
+   **snaps onto the picked curve colour** if one is within a few pixels (same
+   precision as auto-detect), or uses the exact click if not (e.g. no colour
+   picked, or the point really isn't on the traced curve). Added points sit in
+   the same list as detected ones, so **Delete** removes them the same way.
+   Typical flow: auto-**Detect** → prune the wrong ones → **Add point** to
+   pick up the rest by hand.
 6. **Export…** — writes the rows sorted by x, with a metadata header
    (dataset, source image, calibration references, axis types, timestamp).
 
@@ -118,7 +136,6 @@ purpose). Full details, version-bump steps, and optional code-signing are in
 
 ## Roadmap (post-MVP)
 
-- Add-point mode (click on the curve → snap y from the mask).
 - ≥2 calibration refs → least-squares axis fit + a residual readout.
 - Rectangular-to-skewed axis support (projective transform) for photographed
   figures.
